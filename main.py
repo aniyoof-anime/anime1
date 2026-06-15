@@ -452,6 +452,43 @@ async def db_create_episode(
         return ep
 
 
+# Per-season locks to serialise concurrent (forwarded) episode uploads so that
+# the next episode number is computed and assigned atomically, preserving order.
+_episode_locks: dict[int, asyncio.Lock] = {}
+
+
+def _episode_lock(season_id: int) -> asyncio.Lock:
+    lock = _episode_locks.get(season_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _episode_locks[season_id] = lock
+    return lock
+
+
+async def db_append_episode(season_id: int, anime_id: int, video_file_id: str, nomi: str = ""):
+    """Atomically compute the next qism_raqami and insert the episode.
+
+    A per-season asyncio.Lock plus a single SQL statement that derives the
+    next number from MAX(qism_raqami) guarantees correct sequential ordering
+    even when many forwarded videos arrive almost simultaneously.
+    """
+    async with _episode_lock(season_id):
+        async with pool.acquire() as c:
+            async with c.transaction():
+                ep = await c.fetchrow(
+                    "INSERT INTO episodes(season_id,anime_id,qism_raqami,video_file_id,nomi) "
+                    "VALUES($1,$2,"
+                    "(SELECT COALESCE(MAX(qism_raqami),0)+1 FROM episodes WHERE season_id=$1),"
+                    "$3,$4) RETURNING *",
+                    season_id, anime_id, video_file_id, nomi,
+                )
+                await c.execute(
+                    "UPDATE animes SET joylangan_qismlar=joylangan_qismlar+1 WHERE id=$1",
+                    anime_id,
+                )
+            return ep
+
+
 async def db_get_episodes(season_id: int):
     async with pool.acquire() as c:
         return await c.fetch(
@@ -816,6 +853,17 @@ def kb_skip() -> ReplyKeyboardMarkup:
     )
 
 
+def kb_episode_upload() -> ReplyKeyboardMarkup:
+    """Keyboard shown while the admin is uploading episodes one after another."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Tugatish")],
+            [KeyboardButton(text="🏠 Bosh menyu")],
+        ],
+        resize_keyboard=True,
+    )
+
+
 def kb_phone() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -912,6 +960,22 @@ def ik_anime_extra(aid: int, is_fav: bool, is_wl: bool, is_notif: bool) -> Inlin
          InlineKeyboardButton(text="⭐ Baho berish", callback_data=f"rate_{aid}")],
         [InlineKeyboardButton(text=notif_label, callback_data=notif_cb)],
         [InlineKeyboardButton(text="🔙 Orqaga",       callback_data="back_search")],
+    ])
+
+
+def ik_anime_full(aid: int, is_fav: bool, is_wl: bool, is_notif: bool) -> InlineKeyboardMarkup:
+    """Combined keyboard: Watch button + all extra buttons in a single message."""
+    fav_label   = "💔 Sevimlilardan olish" if is_fav   else "❤️ Sevimlilarga"
+    wl_label    = "📋 Watch listdan olish" if is_wl    else "📋 Watch list 💎"
+    notif_label = "🔕 Bildirishnomani o'chirish" if is_notif else "🔔 Bildirishnoma 💎"
+    notif_cb    = f"noff_{aid}" if is_notif else f"non_{aid}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ Tomosha qilish", callback_data=f"watch_{aid}")],
+        [InlineKeyboardButton(text=fav_label, callback_data=f"fav_{aid}"),
+         InlineKeyboardButton(text=wl_label,  callback_data=f"wl_{aid}")],
+        [InlineKeyboardButton(text="💬 Izohlar",     callback_data=f"cmt_{aid}_0"),
+         InlineKeyboardButton(text="⭐ Baho berish", callback_data=f"rate_{aid}")],
+        [InlineKeyboardButton(text=notif_label, callback_data=notif_cb)],
     ])
 
 
@@ -1195,24 +1259,20 @@ async def send_anime_card(target: Message, anime, uid: int) -> None:
     wl    = await db_is_wl(uid, anime["id"])
     notif = await db_is_notif(uid, anime["id"])
     txt   = anime_card_text(anime)
+    kb    = ik_anime_full(anime["id"], fav, wl, notif)
     try:
         if anime["media_type"] == "video":
             await target.answer_video(
                 anime["media_file_id"], caption=txt,
-                reply_markup=ik_anime_watch(anime["id"]), parse_mode="HTML",
+                reply_markup=kb, parse_mode="HTML",
             )
         else:
             await target.answer_photo(
                 anime["media_file_id"], caption=txt,
-                reply_markup=ik_anime_watch(anime["id"]), parse_mode="HTML",
+                reply_markup=kb, parse_mode="HTML",
             )
     except Exception:
-        await target.answer(txt, reply_markup=ik_anime_watch(anime["id"]), parse_mode="HTML")
-    await target.answer(
-        "➕ <b>Qo'shimcha tugmalar:</b>",
-        reply_markup=ik_anime_extra(anime["id"], fav, wl, notif),
-        parse_mode="HTML",
-    )
+        await target.answer(txt, reply_markup=kb, parse_mode="HTML")
 
 
 async def premium_gate(cb: CallbackQuery) -> bool:
@@ -1266,6 +1326,8 @@ async def cmd_start(msg: Message, state: FSMContext, bot: Bot) -> None:
         return
 
     if not await check_sub(bot, uid):
+        if anime_id_arg:
+            await state.update_data(pending_anime=anime_id_arg)
         await msg.answer(
             f"📢 Kanalga obuna bo'ling!\n\n<b>{CHANNEL_USERNAME}</b>",
             reply_markup=ik_channel(), parse_mode="HTML",
@@ -1288,6 +1350,8 @@ async def cb_check_sub(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await cb.answer("❌ Hali obuna bo'lmadingiz!", show_alert=True)
         return
     user = await db_get_user(cb.from_user.id)
+    d    = await state.get_data()
+    pending = d.get("pending_anime")
     try:
         await cb.message.delete()
     except Exception:
@@ -1298,10 +1362,15 @@ async def cb_check_sub(cb: CallbackQuery, state: FSMContext, bot: Bot) -> None:
             "📝 <b>Ismingizni kiriting:</b>", parse_mode="HTML", reply_markup=kb_cancel()
         )
         return
+    await state.clear()
     await cb.message.answer(
         f"✅ Xush kelibsiz, <b>{user['ism']}</b>! 🎌",
         reply_markup=kb_main(), parse_mode="HTML",
     )
+    if pending:
+        a = await db_get_anime(pending)
+        if a:
+            await send_anime_card(cb.message, a, cb.from_user.id)
 
 
 @router.callback_query(F.data == "back_main")
@@ -2035,7 +2104,7 @@ async def cb_fav(cb: CallbackQuery) -> None:
     wl    = await db_is_wl(uid, aid)
     notif = await db_is_notif(uid, aid)
     try:
-        await cb.message.edit_reply_markup(reply_markup=ik_anime_extra(aid, new_fav, wl, notif))
+        await cb.message.edit_reply_markup(reply_markup=ik_anime_full(aid, new_fav, wl, notif))
     except Exception:
         pass
 
@@ -2058,7 +2127,7 @@ async def cb_wl(cb: CallbackQuery) -> None:
     fav   = await db_is_fav(uid, aid)
     notif = await db_is_notif(uid, aid)
     try:
-        await cb.message.edit_reply_markup(reply_markup=ik_anime_extra(aid, fav, new_wl, notif))
+        await cb.message.edit_reply_markup(reply_markup=ik_anime_full(aid, fav, new_wl, notif))
     except Exception:
         pass
 
@@ -2098,7 +2167,7 @@ async def cb_notif_on(cb: CallbackQuery) -> None:
     fav = await db_is_fav(cb.from_user.id, aid)
     wl  = await db_is_wl(cb.from_user.id, aid)
     try:
-        await cb.message.edit_reply_markup(reply_markup=ik_anime_extra(aid, fav, wl, True))
+        await cb.message.edit_reply_markup(reply_markup=ik_anime_full(aid, fav, wl, True))
     except Exception:
         pass
 
@@ -2111,7 +2180,7 @@ async def cb_notif_off(cb: CallbackQuery) -> None:
     fav = await db_is_fav(cb.from_user.id, aid)
     wl  = await db_is_wl(cb.from_user.id, aid)
     try:
-        await cb.message.edit_reply_markup(reply_markup=ik_anime_extra(aid, fav, wl, False))
+        await cb.message.edit_reply_markup(reply_markup=ik_anime_full(aid, fav, wl, False))
     except Exception:
         pass
 
@@ -2568,6 +2637,33 @@ async def adm_add_anime(msg: Message, state: FSMContext) -> None:
     await msg.answer("➕ <b>Anime qo'shish</b>", reply_markup=ik_admin_add(), parse_mode="HTML")
 
 
+@router.callback_query(F.data == "adm_cont")
+async def adm_continue_anime(cb: CallbackQuery, state: FSMContext) -> None:
+    """'📝 Davomini qo'shish' — pick an existing anime to add seasons/episodes to."""
+    if not is_admin(cb.from_user.id):
+        return
+    await state.clear()
+    animes = await db_all_animes()
+    if not animes:
+        await cb.answer("❌ Hali anime yo'q!", show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    for a in animes:
+        b.button(text=f"🎬 {a['kodi']} — {a['nomi']}", callback_data=f"aa_{a['id']}")
+    b.button(text="🔙 Orqaga", callback_data="adm_back")
+    b.adjust(1)
+    try:
+        await cb.message.edit_text(
+            "📝 <b>Qaysi animega davom qo'shasiz?</b>",
+            reply_markup=b.as_markup(), parse_mode="HTML",
+        )
+    except Exception:
+        await cb.message.answer(
+            "📝 <b>Qaysi animega davom qo'shasiz?</b>",
+            reply_markup=b.as_markup(), parse_mode="HTML",
+        )
+
+
 @router.callback_query(F.data == "adm_new")
 async def adm_new_anime_start(cb: CallbackQuery, state: FSMContext) -> None:
     if not is_admin(cb.from_user.id):
@@ -2722,7 +2818,11 @@ async def adm_add_ep_start(cb: CallbackQuery, state: FSMContext) -> None:
         await state.update_data(ep_season_id=seasons[0]["id"])
         await state.set_state(AddEpisode.video)
         await cb.message.answer(
-            f"📺 Video yuboring ({seasons[0]['fasl_nomi']}):", reply_markup=kb_cancel()
+            f"📥 <b>{seasons[0]['fasl_nomi']}</b> uchun videolarni yuboring.\n\n"
+            "Bir nechta qismni ketma-ket (yoki forward qilib) yuborishingiz mumkin — "
+            "ular yuborilgan tartibda 1-qism, 2-qism... bo'lib qo'shiladi.\n\n"
+            "Tugatgach ✅ Tugatish tugmasini bosing.",
+            reply_markup=kb_episode_upload(), parse_mode="HTML",
         )
     else:
         await state.set_state(AddEpisode.sel_season)
@@ -2735,23 +2835,28 @@ async def adm_sel_season(cb: CallbackQuery, state: FSMContext) -> None:
     sid   = int(parts[2])
     await state.update_data(ep_season_id=sid)
     await state.set_state(AddEpisode.video)
-    await cb.message.answer("📺 Video yuboring:", reply_markup=kb_cancel())
+    await cb.message.answer(
+        "📥 Videolarni ketma-ket (yoki forward qilib) yuboring.\n\n"
+        "Ular yuborilgan tartibda qism bo'lib qo'shiladi.\n"
+        "Tugatgach ✅ Tugatish tugmasini bosing.",
+        reply_markup=kb_episode_upload(),
+    )
 
 
 @router.message(AddEpisode.video, F.video)
 async def adm_add_episode(msg: Message, state: FSMContext, bot: Bot) -> None:
     if not is_admin(msg.from_user.id):
         return
-    d      = await state.get_data()
-    sid    = d["ep_season_id"]
-    aid    = d["ep_anime_id"]
-    num    = await db_next_episode_number(sid)
-    ep     = await db_create_episode(sid, aid, num, msg.video.file_id)
-    await state.clear()
-    anime  = await db_get_anime(aid)
+    d   = await state.get_data()
+    sid = d["ep_season_id"]
+    aid = d["ep_anime_id"]
+    # Atomic, lock-protected insert keeps forwarded videos in order and does NOT
+    # clear the FSM state, so the admin can keep sending episodes one after another.
+    ep    = await db_append_episode(sid, aid, msg.video.file_id)
+    anime = await db_get_anime(aid)
     await msg.answer(
         f"✅ {ep['qism_raqami']}-qism qo'shildi! (Jami: {anime['joylangan_qismlar']})",
-        reply_markup=ik_admin_action(aid),
+        reply_markup=kb_episode_upload(),
     )
     # Notify subscribers
     subs = await db_notif_subs(aid)
@@ -2768,9 +2873,31 @@ async def adm_add_episode(msg: Message, state: FSMContext, bot: Bot) -> None:
 
 
 @router.message(AddEpisode.video)
-async def adm_add_episode_wrong(msg: Message) -> None:
-    if msg.text != "❌ Bekor qilish":
-        await msg.answer("🎬 Video fayl yuboring!")
+async def adm_add_episode_other(msg: Message, state: FSMContext) -> None:
+    txt = msg.text or ""
+    if txt == "✅ Tugatish":
+        d   = await state.get_data()
+        aid = d.get("ep_anime_id")
+        await state.clear()
+        if aid:
+            anime = await db_get_anime(aid)
+            jami  = anime["joylangan_qismlar"] if anime else 0
+            await msg.answer(
+                f"✅ Qism qo'shish tugatildi! (Jami joylangan: {jami})",
+                reply_markup=kb_admin(),
+            )
+            await msg.answer("⚙️ Anime boshqaruvi:", reply_markup=ik_admin_action(aid))
+        else:
+            await msg.answer("✅ Tugatildi!", reply_markup=kb_admin())
+        return
+    if txt in ("🏠 Bosh menyu", "❌ Bekor qilish"):
+        await state.clear()
+        await msg.answer("🏠 Bosh menyu", reply_markup=kb_admin())
+        return
+    await msg.answer(
+        "🎬 Video fayl yuboring yoki ✅ Tugatish tugmasini bosing!",
+        reply_markup=kb_episode_upload(),
+    )
 
 
 # ── Edit Anime ────────────────────────────────────────────────────────────────
